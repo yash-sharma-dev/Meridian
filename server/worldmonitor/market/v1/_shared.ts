@@ -279,23 +279,26 @@ function parseYahooChartResponse(data: YahooChartResponse): { price: number; cha
 export async function fetchYahooQuote(
   symbol: string,
 ): Promise<{ price: number; change: number; sparkline: number[] } | null> {
-  // Try direct Yahoo first
-  try {
-    await yahooGate();
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': CHROME_UA },
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    if (resp.ok) {
-      const data: YahooChartResponse = await resp.json();
-      const parsed = parseYahooChartResponse(data);
-      if (parsed) return parsed;
-    } else {
-      console.warn(`[Yahoo] ${symbol} direct HTTP ${resp.status}`);
+  // Try direct Yahoo first (query1, then query2 as fallback for rate limits)
+  for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
+    try {
+      await yahooGate();
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}`;
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': CHROME_UA },
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      if (resp.ok) {
+        const data: YahooChartResponse = await resp.json();
+        const parsed = parseYahooChartResponse(data);
+        if (parsed) return parsed;
+        break;
+      } else {
+        console.warn(`[Yahoo] ${symbol} ${host} HTTP ${resp.status}`);
+      }
+    } catch (err) {
+      console.warn(`[Yahoo] ${symbol} ${host} error:`, (err as Error).message);
     }
-  } catch (err) {
-    console.warn(`[Yahoo] ${symbol} direct error:`, (err as Error).message);
   }
 
   // Fallback: Railway relay (different IP, not rate-limited by Yahoo)

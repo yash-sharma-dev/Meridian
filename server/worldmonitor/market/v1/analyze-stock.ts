@@ -477,12 +477,17 @@ function uniqueRounded(values: number[]): number[] {
 
 export async function fetchYahooHistory(symbol: string): Promise<{ candles: Candle[]; currency: string } | null> {
   await yahooGate();
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d&includePrePost=false&events=div,splits`;
-  const response = await fetch(url, {
-    headers: { 'User-Agent': CHROME_UA },
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-  });
-  if (!response.ok) return null;
+  const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d&includePrePost=false&events=div,splits`;
+  const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+  let response: Response | null = null;
+  for (const host of hosts) {
+    const r = await fetch(`https://${host}${path}`, {
+      headers: { 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    if (r.ok) { response = r; break; }
+  }
+  if (!response) return null;
 
   const data = await response.json() as YahooChartResponse;
   const result = data.chart?.result?.[0];
@@ -972,7 +977,7 @@ async function buildAiOverlay(
     temperature: 0.2,
     maxTokens: 500,
     timeoutMs: 20_000,
-    providerOrder: ['openrouter', 'generic'],
+    providerOrder: ['groq', 'openrouter', 'generic'],
     validate: (content) => {
       try {
         const parsed = JSON.parse(content) as Record<string, unknown>;
