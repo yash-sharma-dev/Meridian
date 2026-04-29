@@ -10,7 +10,7 @@ import type {
 import { callLlm } from '../../../_shared/llm';
 import { cachedFetchJson } from '../../../_shared/redis';
 import { CHROME_UA, yahooGate } from '../../../_shared/constants';
-import { UPSTREAM_TIMEOUT_MS, sanitizeSymbol } from './_shared';
+import { UPSTREAM_TIMEOUT_MS, sanitizeSymbol, fetchFinnhubQuote } from './_shared';
 import { storeStockAnalysisSnapshot } from './premium-stock-store';
 import { searchRecentStockHeadlines } from './stock-news-search';
 
@@ -359,7 +359,7 @@ export async function fetchDividendProfile(symbol: string, currentPrice: number)
   }
 }
 
-const CACHE_TTL_SECONDS = 900;
+const CACHE_TTL_SECONDS = 7200; // 2 hours — reduces Yahoo hits to ~12/day per symbol
 const NEWS_LIMIT = 5;
 const BIAS_THRESHOLD = 5;
 const VOLUME_SHRINK_RATIO = 0.7;
@@ -475,49 +475,84 @@ function uniqueRounded(values: number[]): number[] {
   return out;
 }
 
+class YahooRateLimitError extends Error {
+  constructor() { super('Yahoo Finance rate limited (429)'); this.name = 'YahooRateLimitError'; }
+}
+
+async function fetchFinnhubHistory(symbol: string): Promise<{ candles: Candle[]; currency: string } | null> {
+  const key = process.env.FINNHUB_API_KEY;
+  if (!key) return null;
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - 185 * 24 * 60 * 60; // ~6 months
+  try {
+    const r = await fetch(
+      `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${key}`,
+      { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) },
+    );
+    if (!r.ok) return null;
+    const d = await r.json() as { s: string; t?: number[]; o?: number[]; h?: number[]; l?: number[]; c?: number[]; v?: number[] };
+    if (d.s !== 'ok' || !d.t?.length) return null;
+    const candles: Candle[] = [];
+    for (let i = 0; i < d.t.length; i++) {
+      const close = d.c?.[i], open = d.o?.[i], high = d.h?.[i], low = d.l?.[i];
+      if (![close, open, high, low].every((v) => typeof v === 'number' && Number.isFinite(v))) continue;
+      candles.push({
+        timestamp: (d.t[i] ?? 0) * 1000,
+        open: open as number, high: high as number, low: low as number, close: close as number,
+        volume: typeof d.v?.[i] === 'number' && Number.isFinite(d.v[i] as number) ? (d.v[i] as number) : 0,
+      });
+    }
+    if (candles.length < 30) return null;
+    return { candles, currency: 'USD' };
+  } catch { return null; }
+}
+
 export async function fetchYahooHistory(symbol: string): Promise<{ candles: Candle[]; currency: string } | null> {
+  // Finnhub candles first (requires premium key — free keys get 403, silently skipped)
+  const finnhub = await fetchFinnhubHistory(symbol);
+  if (finnhub) return finnhub;
+
+  // Yahoo Finance fallback (query1 then query2).
+  // Throws YahooRateLimitError on 429 so cachedFetchJson does NOT store a negative
+  // sentinel — the next request retries immediately instead of being blocked for 2min.
   await yahooGate();
   const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d&includePrePost=false&events=div,splits`;
-  const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
-  let response: Response | null = null;
-  for (const host of hosts) {
-    const r = await fetch(`https://${host}${path}`, {
-      headers: { 'User-Agent': CHROME_UA },
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    if (r.ok) { response = r; break; }
+  for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
+    try {
+      const r = await fetch(`https://${host}${path}`, {
+        headers: { 'User-Agent': CHROME_UA },
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      if (r.status === 429) throw new YahooRateLimitError();
+      if (r.ok) {
+        const data = await r.json() as YahooChartResponse;
+        const result = data.chart?.result?.[0];
+        const quote = result?.indicators?.quote?.[0];
+        const timestamps = result?.timestamp ?? [];
+        const closes = quote?.close ?? [];
+        const opens = quote?.open ?? [];
+        const highs = quote?.high ?? [];
+        const lows = quote?.low ?? [];
+        const volumes = quote?.volume ?? [];
+        const candles: Candle[] = [];
+        for (let i = 0; i < timestamps.length; i++) {
+          const close = closes[i], open = opens[i], high = highs[i], low = lows[i];
+          if (![close, open, high, low].every((v) => typeof v === 'number' && Number.isFinite(v))) continue;
+          candles.push({
+            timestamp: (timestamps[i] ?? 0) * 1000,
+            open: open as number, high: high as number, low: low as number, close: close as number,
+            volume: typeof volumes[i] === 'number' && Number.isFinite(volumes[i]) ? (volumes[i] as number) : 0,
+          });
+        }
+        if (candles.length >= 30) return { candles, currency: result?.meta?.currency || 'USD' };
+        return null;
+      }
+    } catch (err) {
+      if (err instanceof YahooRateLimitError) throw err;
+      // network/timeout errors — try next host
+    }
   }
-  if (!response) return null;
-
-  const data = await response.json() as YahooChartResponse;
-  const result = data.chart?.result?.[0];
-  const quote = result?.indicators?.quote?.[0];
-  const timestamps = result?.timestamp ?? [];
-  const closes = quote?.close ?? [];
-  const opens = quote?.open ?? [];
-  const highs = quote?.high ?? [];
-  const lows = quote?.low ?? [];
-  const volumes = quote?.volume ?? [];
-
-  const candles: Candle[] = [];
-  for (let i = 0; i < timestamps.length; i++) {
-    const close = closes[i];
-    const open = opens[i];
-    const high = highs[i];
-    const low = lows[i];
-    if (![close, open, high, low].every((value) => typeof value === 'number' && Number.isFinite(value))) continue;
-    candles.push({
-      timestamp: (timestamps[i] ?? 0) * 1000,
-      open: open as number,
-      high: high as number,
-      low: low as number,
-      close: close as number,
-      volume: typeof volumes[i] === 'number' && Number.isFinite(volumes[i]) ? (volumes[i] as number) : 0,
-    });
-  }
-
-  if (candles.length < 30) return null;
-  return { candles, currency: result?.meta?.currency || 'USD' };
+  return null;
 }
 
 function safeRaw(field: { raw?: number } | undefined): number {
@@ -1217,6 +1252,92 @@ export async function analyzeStock(
     });
     await storeStockAnalysisSnapshot(response, includeNews);
     return response;
+  }).catch(async (err: unknown) => {
+    // Yahoo rate limited → build a degraded response from Finnhub quote + Groq.
+    // We do NOT store this in Redis so the next request retries the full analysis.
+    if (!(err instanceof YahooRateLimitError)) throw err;
+    const finnhubKey = process.env.FINNHUB_API_KEY;
+    const fq = finnhubKey ? await fetchFinnhubQuote(symbol, finnhubKey) : null;
+    if (!fq) return null;
+    const quote = { price: fq.price, changePercent: fq.changePercent };
+    const now = Date.now();
+    // Build a minimal technical snapshot from current-price data only.
+    const minimalTechnical: TechnicalSnapshot = {
+      currentPrice: quote.price,
+      changePercent: quote.changePercent,
+      currency: 'USD',
+      ma5: 0, ma10: 0, ma20: 0, ma60: 0,
+      biasMa5: 0, biasMa10: 0, biasMa20: 0,
+      maAlignment: 'N/A',
+      trendStatus: 'Data limited',
+      trendStrength: 0,
+      volumeStatus: 'N/A',
+      volumeTrend: 'N/A',
+      volumeRatio5d: 0,
+      macdStatus: 'N/A',
+      macdSignal: 'N/A',
+      macdDif: 0, macdDea: 0, macdBar: 0,
+      rsi6: 0, rsi12: 0, rsi24: 0, rsiStatus: 'N/A', rsiSignal: 'N/A',
+      signal: 'Watch',
+      signalScore: 50,
+      bullishFactors: [],
+      riskFactors: ['Full technical analysis temporarily unavailable'],
+      supportLevels: [],
+      resistanceLevels: [],
+      supportMa5: false,
+      supportMa10: false,
+    };
+    const headlines = includeNews
+      ? await searchRecentStockHeadlines(symbol, name, NEWS_LIMIT).then((r) => r.headlines).catch(() => [])
+      : [];
+    const overlay = await buildAiOverlay(symbol, name, minimalTechnical, headlines);
+    return {
+      available: true,
+      symbol, name, display: symbol,
+      currency: 'USD',
+      currentPrice: quote.price,
+      changePercent: quote.changePercent,
+      signalScore: 50,
+      signal: 'Watch',
+      trendStatus: 'Data limited',
+      volumeStatus: 'N/A',
+      macdStatus: 'N/A',
+      rsiStatus: 'N/A',
+      summary: overlay.summary,
+      action: overlay.action,
+      confidence: overlay.confidence,
+      technicalSummary: overlay.technicalSummary,
+      newsSummary: overlay.newsSummary,
+      whyNow: overlay.whyNow,
+      bullishFactors: overlay.bullishFactors,
+      riskFactors: overlay.riskFactors,
+      supportLevels: [],
+      resistanceLevels: [],
+      headlines,
+      ma5: 0, ma10: 0, ma20: 0, ma60: 0,
+      biasMa5: 0, biasMa10: 0, biasMa20: 0,
+      volumeRatio5d: 0,
+      rsi12: 0,
+      macdDif: 0, macdDea: 0, macdBar: 0,
+      provider: overlay.provider,
+      model: overlay.model,
+      fallback: true,
+      newsSearched: includeNews,
+      generatedAt: new Date().toISOString(),
+      analysisId: '',
+      analysisAt: now,
+      stopLoss: 0,
+      takeProfit: 0,
+      engineVersion: STOCK_ANALYSIS_ENGINE_VERSION,
+      analystConsensus: EMPTY_ANALYST_DATA.analystConsensus,
+      priceTarget: EMPTY_ANALYST_DATA.priceTarget,
+      recentUpgrades: [],
+      dividendYield: 0,
+      trailingAnnualDividendRate: 0,
+      exDividendDate: 0,
+      dividendFrequency: '',
+      dividendCagr: 0,
+    } as AnalyzeStockResponse;
   });
 
   if (cached) return cached;

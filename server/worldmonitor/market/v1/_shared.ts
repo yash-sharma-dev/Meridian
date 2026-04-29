@@ -279,7 +279,14 @@ function parseYahooChartResponse(data: YahooChartResponse): { price: number; cha
 export async function fetchYahooQuote(
   symbol: string,
 ): Promise<{ price: number; change: number; sparkline: number[] } | null> {
-  // Try direct Yahoo first (query1, then query2 as fallback for rate limits)
+  // Finnhub first for plain US stock symbols (not futures =F, indices ^, forex =X)
+  const finnhubKey = process.env.FINNHUB_API_KEY;
+  if (finnhubKey && !/[=^]/.test(symbol) && !symbol.endsWith('=F')) {
+    const fq = await fetchFinnhubQuote(symbol, finnhubKey);
+    if (fq) return { price: fq.price, change: fq.changePercent, sparkline: [] };
+  }
+
+  // Yahoo Finance fallback (query1, then query2)
   for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
     try {
       await yahooGate();
@@ -301,28 +308,19 @@ export async function fetchYahooQuote(
     }
   }
 
-  // Fallback: Railway relay (different IP, not rate-limited by Yahoo)
+  // Last resort: Railway relay
   const relayBase = getRelayBaseUrl();
-  if (!relayBase) {
-    console.warn(`[Yahoo] ${symbol} relay skipped: WS_RELAY_URL not set`);
-    return null;
-  }
+  if (!relayBase) return null;
   try {
     const relayUrl = `${relayBase}/yahoo-chart?symbol=${encodeURIComponent(symbol)}`;
     const resp = await fetch(relayUrl, {
       headers: getRelayHeaders(),
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
-    if (!resp.ok) {
-      console.warn(`[Yahoo] ${symbol} relay HTTP ${resp.status}: ${await resp.text().catch(() => '')}`);
-      return null;
-    }
+    if (!resp.ok) return null;
     const data: YahooChartResponse = await resp.json();
     return parseYahooChartResponse(data);
-  } catch (err) {
-    console.warn(`[Yahoo] ${symbol} relay error:`, (err as Error).message);
-    return null;
-  }
+  } catch { return null; }
 }
 
 // ========================================================================
